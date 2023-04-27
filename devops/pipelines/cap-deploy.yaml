@@ -1,0 +1,191 @@
+trigger:
+- main
+
+resources:
+- repo: self
+
+parameters:
+  - name: env
+    displayName: Environment to manage
+    type: string
+    default: test
+    values:
+    - test
+    - all
+  - name: cleanup
+    type: boolean
+    default: false
+
+variables:
+- template: config/${{ parameters.env }}.yaml
+- name: imgtag
+  value: '$(Build.BuildId)'
+- name: imgname
+  value: 'noderedis-example'
+- name: majorVersion
+  value: '1.0'
+
+stages:
+
+# Build the app container
+- stage: Build
+  displayName: Build container image
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: CmdLine@2
+      displayName: Show environment
+      inputs:
+        script: |
+          env | sort
+    - task: CmdLine@2
+      displayName: Get client IP address
+      inputs:
+        script: |
+          IP=($(curl -s http://ipinfo.io/json | jq -r '.ip'))
+          echo "This Microsoft hosted agent public IP is: ${IP}"
+          echo "##vso[task.setvariable variable=AGENT_IP]$(curl -s http://ipinfo.io/json | jq -r '.ip')"
+    - task: AzureCLI@2
+      displayName: "Show resource group"
+      inputs:
+        azureSubscription: ${{ variables.SERVICE_CONNECTION }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az group show -g ${{ variables.RESOURCE_GROUP }} | jq -r '.id'
+          export RG_ID=$(az group show -g ${{ variables.RESOURCE_GROUP }} | jq -r '.id')
+          echo "##vso[task.setvariable variable=rgId]${RG_ID}"
+    - task: AzureCLI@2
+      displayName: "Enable az extensions autoinstall"
+      inputs:
+        azureSubscription: $(SERVICE_CONNECTION)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az config set extension.use_dynamic_install=yes_without_prompt
+    - task: AzureCLI@2
+      displayName: "Set ACR credentials for the account"
+      inputs:
+        azureSubscription: $(SERVICE_CONNECTION)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az acr login -n $(ACR_NAME)
+          ACRUSER=$(az acr credential show --name $(ACR_NAME)  --query "username")
+          echo "##vso[task.setvariable variable=ACRUSER;]$ACRUSER"
+          ACRPASS=$(az acr credential show --name $(ACR_NAME) --query "passwords[0].value")
+          echo "##vso[task.setvariable variable=ACRPASS;]$ACRPASS"
+    - task: AzureCLI@2
+      displayName: "Build and publish container image"
+      inputs:
+        azureSubscription: $(SERVICE_CONNECTION)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az acr build --registry $(ACR_NAME) --image $(imgname):$(majorVersion).$BUILD_BUILDID ./web
+          az acr repository untag -n $(ACR_NAME) -t $(imgname):latest
+          az acr import \
+            --name $(ACR_NAME) \
+            --source $(ACR_NAME)/$(imgname):$(majorVersion).$BUILD_BUILDID \
+            --image $(imgname):latest
+    - task: AzureKeyVault@2
+      displayName: Getting secrets from the dev Key Vault
+      inputs:
+        azureSubscription: $(SERVICE_CONNECTION)
+        KeyVaultName: $(KV_NAME)
+    - task: AzureCLI@2
+      displayName: "Create Container App"
+      inputs:
+        azureSubscription: $(SERVICE_CONNECTION)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az containerapp create \
+            --name $(imgname) \
+            --resource-group $(RESOURCE_GROUP) \
+            --image $(ACR_NAME)/$(imgname):$(majorVersion).$BUILD_BUILDID \
+            --environment $(CAP_ENV) \
+            --registry-server $(ACR_NAME) \
+            --registry-username $(ACRUSER) \
+            --registry-password $(ACRPASS) \
+            --min-replicas 0 \
+            --max-replicas 3 \
+            --scale-rule-name azure-http-rule \
+            --scale-rule-type http \
+            --scale-rule-http-concurrency 10 \
+            --secrets "redis-password=$(redis-password)" \
+            --env-vars \
+            REDIS_HOST=$(az redis show -n $(REDIS_NAME) -g $(RESOURCE_GROUP) | jq -r ".hostName") \
+            REDIS_PORT=$(az redis show -n $(REDIS_NAME) -g $(RESOURCE_GROUP) | jq -r ".sslPort") \
+            "REDIS_PASSWORD=secretref:redis-password" \
+            "REDIS_TLS=true"
+          #"$(REDIS_NAME).privatelink.redis.cache.windows.net" - private
+          #REDIS_HOST=$(az redis show -n $(REDIS_NAME) -g $(RESOURCE_GROUP) | jq -r ".hostName") - public
+    - task: AzureCLI@2
+      displayName: Enable container app ingress
+      inputs:
+        azureSubscription: $(SERVICE_CONNECTION)
+        scriptType: "bash"
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          az containerapp ingress enable \
+            --type external \
+            --name $(imgname) \
+            --resource-group $(RESOURCE_GROUP) \
+            --target-port 5000 \
+            --transport auto
+    - task: AzureCLI@2
+      displayName: Restrict access to container app ingress
+      inputs:
+        azureSubscription: $(SERVICE_CONNECTION)
+        scriptType: "bash"
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+            az containerapp ingress access-restriction set \
+              -n $(imgname) \
+              -g $(RESOURCE_GROUP) \
+              --rule-name ado-client \
+              --ip-address $(curl -s http://ipinfo.io/json | jq -r '.ip') \
+              --description "Allow access from ADO client" \
+              --action Allow
+    - task: AzureCLI@2
+      displayName: Test container app ingress
+      inputs:
+        azureSubscription: $(SERVICE_CONNECTION)
+        scriptType: "bash"
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          FQDN=$(az containerapp ingress show -n $(imgname) -g $(RESOURCE_GROUP) | jq -r ".fqdn")
+          echo "##vso[task.setvariable variable=FQDN;]$FQDN"
+          curl -w '%{http_code}\n' -s -LI  https://${FQDN}
+          CODE=$(curl -w '%{http_code}\n' -s -o /dev/null -LI  https://${FQDN})
+          if [[ "$CODE" -ne 200 ]] ; then
+            echo "Service returened error code: $CODE"
+            exit 1
+          else
+            echo "Service is available with code: $CODE"
+          fi
+    - task: CmdLine@2
+      displayName: Inject app URL into test script
+      inputs:
+        script: |
+          cat tests/load/k6-test.js | sed "s/TARGET/$FQDN/" > test.js
+    - task: k6-load-test@0
+      displayName: "Load test the container app"
+      inputs:
+        filename: 'test.js'
+    - task: AzureCLI@2
+      displayName: "Cleanup container app"
+      inputs:
+        azureSubscription: $(SERVICE_CONNECTION)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az containerapp delete --yes -n $(imgname) -g $(RESOURCE_GROUP)
+      condition: and(succeeded(), eq('${{ parameters.cleanup }}', 'true'))
