@@ -19,7 +19,7 @@ Cloud infrastructure resources except the resource group and its basic permissio
 
 Login to Azure: `az login`
 
-If needed select a subscription: `az account set --subscription d7d0b744-7dd4-494d-b357-0e13c93cf89e`
+If needed select a subscription: `az account set --subscription XXX-YYY-ZZZ`
 
 Run terraform:
 ```
